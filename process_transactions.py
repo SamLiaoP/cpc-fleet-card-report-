@@ -292,4 +292,87 @@ if file_count == 0:
     print("\n❌ 沒有產生任何檔案！")
 else:
     print(f"\n✅ 成功產生 {file_count} 個月份的 summary 檔案！")
+
+# ================================
+# 作帳用：非汽油產品銷售明細
+# ================================
+# 排除汽油與超級柴油（含各自的折抵額列，名稱都含「無鉛汽油」或「超級柴油」），
+# 以及付款/沖銷列（車隊卡消費、捷利卡消費、點數折抵等，非實際產品）。
+print("\n================================")
+print(" 產出作帳用非汽油產品明細")
+print("================================")
+
+payment_rows = categories + [
+    "點數折抵商品A58",
+    "點數折抵免稅商品A59",
+]
+
+is_fuel = df["商品名稱"].astype(str).str.contains("無鉛汽油|超級柴油", na=False)
+is_payment = df["商品名稱"].isin(payment_rows)
+df_acct = df[~is_fuel & ~is_payment & df["月份"].notna()].copy()
+
+acct_file_count = 0
+if df_acct.empty:
+    print("⚠️ 沒有非汽油產品的交易資料，跳過")
+else:
+    detail_cols = [
+        "交易時間", "島號", "槍號", "發票號碼", "交易類別", "付款類別",
+        "車號", "統一編號", "商品名稱", "單價", "數量", "商品金額",
+    ]
+    detail_cols = [c for c in detail_cols if c in df_acct.columns]
+
+    for month, df_m in df_acct.groupby("月份"):
+        print(f"\n📅 處理月份：{month} (共 {len(df_m)} 筆)")
+        try:
+            detail = df_m.sort_values("交易時間")[detail_cols].copy()
+            detail["交易時間"] = detail["交易時間"].dt.strftime("%Y/%m/%d %H:%M:%S")
+
+            # 彙總：折抵額為負數，直接加總即為淨額；退貨負數也會正確抵消
+            summary = df_m.groupby("商品名稱").agg(
+                交易筆數=pd.NamedAgg(column="商品名稱", aggfunc="size"),
+                銷售數量=pd.NamedAgg(column="數量", aggfunc="sum"),
+                銷售金額=pd.NamedAgg(column="商品金額", aggfunc="sum"),
+            ).sort_values("銷售金額", ascending=False).reset_index()
+
+            # 每個產品一個頁籤，頁籤名稱用產品名稱
+            # Excel 頁籤名稱限制：最長 31 字元，不能含 / \ * ? [ ] : 等字元
+            def safe_sheet_name(name, used):
+                name = re.sub(r'[\\/*?\[\]:]', '_', str(name)).strip() or "未命名"
+                name = name[:31]
+                base = name
+                n = 2
+                while name in used:
+                    suffix = f"_{n}"
+                    name = base[:31 - len(suffix)] + suffix
+                    n += 1
+                used.add(name)
+                return name
+
+            output_file = os.path.join(current_dir, f"作帳_非汽油產品_{month}.xlsx")
+            with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+                sheets = [("彙總", summary)]
+                used_names = {"彙總"}
+                # 依彙總表的順序（銷售金額由大到小）建立各產品頁籤
+                for product in summary["商品名稱"]:
+                    product_detail = detail[detail["商品名稱"] == product]
+                    sheets.append((safe_sheet_name(product, used_names), product_detail))
+                # 寫入並調整欄寬方便閱讀
+                for sheet_name, frame in sheets:
+                    frame.to_excel(writer, sheet_name=sheet_name, index=False)
+                    ws = writer.sheets[sheet_name]
+                    for i, col in enumerate(frame.columns, start=1):
+                        max_len = max(
+                            [len(str(col))] + [len(str(v)) for v in frame[col].head(200)]
+                        )
+                        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(max_len + 4, 40)
+            print(f"   ✅ 已儲存: {output_file}")
+            acct_file_count += 1
+        except Exception as e:
+            print(f"   ❌ 處理月份 {month} 時發生錯誤：{str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    if acct_file_count > 0:
+        print(f"\n✅ 成功產生 {acct_file_count} 個月份的作帳用非汽油產品明細！")
+
 input("\n按 Enter 鍵退出...")
