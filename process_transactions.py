@@ -437,6 +437,349 @@ def build_invoice_table(df_all):
     return item, others, notes
 
 
+# ================================
+# 班報（格式比照手算班報 115.MM.xlsx：金額表 / 出油量表 / 品項金額）
+# ================================
+# 每班一欄：1 日 A 班、1 日 B 班、2 日 A 班 … 31 日 B 班，最後一欄月合計。
+# A 班 = 列帳班別 _2，B 班 = 列帳班別 _3。
+# CSV 算得出來的格子填數字，算不出來的（信用卡/行動支付各品牌、液面鏡、機械表、
+# PD(四)、進油、噴油、農機優惠、二行程）留空；小計、月合計等維持班報原本的公式。
+from openpyxl.styles import Font, Border, Side, Alignment
+from openpyxl.utils import get_column_letter
+
+SHIFT_CODE_TO_AB = {"2": "A", "3": "B"}
+DAYS_IN_SHEET = 31
+FIRST_DATA_COL = 2                     # B
+LAST_DATA_COL = FIRST_DATA_COL + DAYS_IN_SHEET * 2 - 1   # BK
+TOTAL_COL = LAST_DATA_COL + 1          # BL
+
+
+def shift_col(day, ab):
+    return FIRST_DATA_COL + (int(day) - 1) * 2 + (0 if ab == "A" else 1)
+
+
+def shift_series_to_cells(series):
+    """series index = (day, 'A'/'B') → {col: value}"""
+    out = {}
+    for (day, ab), v in series.items():
+        if pd.isna(day) or ab not in ("A", "B"):
+            continue
+        if 1 <= int(day) <= DAYS_IN_SHEET and v != 0:
+            out[shift_col(day, ab)] = v
+    return out
+
+
+def build_shift_report_data(df_month):
+    """算出班報三張表每一班的數字。回傳 dict: 表名 → {列號: {欄號: 值}}。"""
+    d = df_month.copy()
+    key = ["島號", "槍號", "交易時間"]
+    for c in ["交易總金額", "發票金額", "折扣金額", "商品金額", "數量"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+    d["_paytype"] = pd.to_numeric(d["付款類別"], errors="coerce")
+    ex = d["列帳班別"].astype(str).str.strip().str.extract(r"^\d{3}\d{2}(\d{2})_(\d)")
+    d["_day"] = pd.to_numeric(ex[0], errors="coerce")
+    d["_ab"] = ex[1].map(SHIFT_CODE_TO_AB)
+    fallback = d["_day"].isna() | d["_ab"].isna()
+    if fallback.any():
+        d.loc[fallback, "_day"] = d.loc[fallback, "交易時間"].dt.day
+        d.loc[fallback, "_ab"] = "A"
+    d["_day"] = d["_day"].astype(int)
+    name = d["商品名稱"].astype(str)
+    d["_prod"] = d["商品名稱"].apply(invoice_product)
+    d["_is_disc"] = name.str.contains("折抵額", na=False)
+    d["_is_test"] = d["_paytype"] == TEST_BUCKET_PAY_TYPE
+    d["_grp"] = np.select([d["_prod"].isin(["九二", "九五", "超柴"]), d["_prod"] == "尿素"], ["主油", "尿素"], "副產品")
+    d.loc[d["_prod"].isna(), "_grp"] = None
+
+    g = d.groupby(key)
+    txn = g.agg(
+        day=("_day", "first"), ab=("_ab", "first"), pc=("_paytype", "first"),
+        交易總=("交易總金額", "first"), 發票=("發票金額", "first"), 折扣=("折扣金額", "first"),
+        發票號=("發票號碼", "first"), 作廢=("是否作廢", "first"),
+    )
+    txn["has_bonus"] = g["商品名稱"].agg(lambda s: (s == "捷利卡優惠點消費－應稅").any())
+    txn["has_point"] = g["商品名稱"].agg(lambda s: s.isin(POINT_GOODS_ROWS).any())
+    txn["exempt"] = np.where(txn["發票"] != 0, txn["交易總"] - txn["發票"] - txn["折扣"], 0.0)
+    d = d.merge(txn[["pc", "發票", "has_bonus", "has_point", "exempt"]].rename(columns={"pc": "_pc", "發票": "_inv"}),
+                left_on=key, right_index=True, how="left")
+    sk = ["_day", "_ab"]
+
+    def by_shift(frame, col):
+        if frame.empty:
+            return pd.Series(dtype=float)
+        s = frame.groupby(sk)[col].sum()
+        s.index = pd.MultiIndex.from_tuples([(int(a), b) for a, b in s.index])
+        return s
+
+    prod = d[d["_prod"].notna() & ~d["_is_test"]]
+    is_sign = (d["_pc"] == 903) & (d["_inv"] == 0)
+    is_fleet = d["_pc"] == 905
+
+    # 付款列依交易內商品金額比例拆成 主油/尿素/副產品
+    def split_payment(pname, txn_mask):
+        m = (d["商品名稱"] == pname) & txn_mask
+        pay = -d.loc[m].groupby(key)["商品金額"].sum()
+        pr = d[d["_prod"].notna() & ~d["_is_test"]].merge(pay.rename("_pay"), left_on=key, right_index=True, how="inner")
+        tsum = pr.groupby(key)["商品金額"].transform("sum")
+        pr["_alloc"] = pr["_pay"] * np.where(tsum != 0, pr["商品金額"] / tsum.replace(0, np.nan), 0)
+        return {grp: by_shift(pr[pr["_grp"] == grp], "_alloc") for grp in ["主油", "尿素", "副產品"]}
+
+    jet = split_payment("捷利卡消費 (A53", ~d["has_bonus"].fillna(False))
+    gift = split_payment("禮物卡消費－應稅", pd.Series(True, index=d.index))
+
+    def pay_rows(pname, txn_mask=None):
+        m = d["商品名稱"] == pname
+        if txn_mask is not None:
+            m &= txn_mask
+        return -by_shift(d[m], "商品金額")
+
+    # 農機免稅依交易內油品金額比例分到油品
+    exempt_txn = txn[txn["exempt"] != 0]["exempt"]
+    if not exempt_txn.empty:
+        pe = prod.merge(exempt_txn.rename("_ex"), left_on=key, right_index=True, how="inner")
+        tsum = pe.groupby(key)["商品金額"].transform("sum")
+        pe["_exs"] = pe["_ex"] * np.where(tsum != 0, pe["商品金額"] / tsum.replace(0, np.nan), 0)
+    else:
+        pe = prod.iloc[0:0].assign(_exs=[])
+
+    def exempt_of(p):
+        return by_shift(pe[pe["_prod"] == p], "_exs") if not pe.empty else pd.Series(dtype=float)
+
+    disc = d[d["_is_disc"]].copy()
+    disc["_dprod"] = disc["商品名稱"].astype(str).apply(discount_product)
+
+    def disc_of(p):
+        return -by_shift(disc[disc["_dprod"] == p], "商品金額")
+
+    def prod_amt(p, mask=None):
+        f = prod[prod["_prod"] == p] if mask is None else prod[(prod["_prod"] == p) & mask.reindex(prod.index).fillna(False)]
+        return by_shift(f, "商品金額")
+
+    def add(*series):
+        out = None
+        for s_ in series:
+            if s_ is None or len(s_) == 0:
+                continue
+            s_ = s_.copy()
+            s_.index = pd.MultiIndex.from_tuples(list(s_.index))
+            out = s_ if out is None else out.add(s_, fill_value=0)
+        return out if out is not None else pd.Series(dtype=float)
+
+    point_goods_amt = -by_shift(d[d["商品名稱"].isin(POINT_GOODS_ROWS)], "商品金額")
+    point_txn_goods = prod_amt("副產品", d["has_point"].fillna(False))
+
+    尿素_total = prod_amt("尿素")
+    尿素_簽帳 = prod_amt("尿素", is_sign)
+    尿素_車隊卡 = prod_amt("尿素", is_fleet)
+    尿素_捷利卡 = jet["尿素"]
+    尿素_現銷 = add(尿素_total, -尿素_簽帳, -尿素_車隊卡, -尿素_捷利卡)
+
+    副_total = prod_amt("副產品")
+    副_簽帳 = prod_amt("副產品", is_sign)
+    副_捷利卡 = jet["副產品"]
+    副_兌換 = point_txn_goods
+    副_現銷 = add(副_total, -副_簽帳, -副_捷利卡, -副_兌換)
+
+    txn_inv = txn[txn["發票號"].notna() & (txn["作廢"] != 1)]
+    inv_cnt = txn_inv.groupby(["day", "ab"])["發票號"].nunique() if not txn_inv.empty else pd.Series(dtype=float)
+    inv_cnt.index = pd.MultiIndex.from_tuples([(int(a), b) for a, b in inv_cnt.index]) if len(inv_cnt) else inv_cnt.index
+
+    def txn_sum(mask, col):
+        t = txn[mask]
+        if t.empty:
+            return pd.Series(dtype=float)
+        s = t.groupby(["day", "ab"])[col].sum()
+        s.index = pd.MultiIndex.from_tuples([(int(a), b) for a, b in s.index])
+        return s
+
+    金額表 = {
+        4: txn_sum((txn["pc"] == 903) & (txn["發票"] == 0), "交易總"),           # 簽帳
+        9: txn_sum(txn["pc"] == 931, "發票"),                                  # 信用卡小計
+        22: txn_sum(txn["pc"] == 939, "發票"),                                 # 行動支付
+        24: pay_rows("車隊卡消費 (A55"),
+        26: jet["主油"], 27: jet["尿素"], 28: jet["副產品"],
+        29: add(gift["主油"], gift["尿素"]), 30: gift["副產品"],
+        31: pay_rows("捷利卡優惠點消費－應稅"),
+        32: pay_rows("捷利卡消費 (A53", d["has_bonus"].fillna(False)),
+        35: pay_rows("其他應收款-電子優惠券"),
+        37: pay_rows("點數折抵主油A57"),
+        39: 尿素_現銷, 40: 尿素_簽帳, 41: 尿素_車隊卡, 42: 尿素_捷利卡,
+        46: 副_簽帳, 47: 副_捷利卡, 48: 副_現銷, 49: 副_兌換,
+        52: point_goods_amt,
+        54: txn_sum(txn["exempt"] != 0, "exempt"),
+        56: -by_shift(disc, "商品金額"),
+        59: by_shift(d[d["_is_test"] & d["_prod"].notna()], "商品金額"),
+        64: inv_cnt,
+    }
+    品項金額 = {
+        3: add(prod_amt("九二"), exempt_of("九二")),
+        4: add(prod_amt("九五"), exempt_of("九五")),
+        5: add(prod_amt("超柴"), exempt_of("超柴")),
+        6: 尿素_total,
+        7: add(副_total, -point_goods_amt),
+        9: add(disc_of("九二"), exempt_of("九二")),
+        10: add(disc_of("九五"), exempt_of("九五")),
+        11: add(disc_of("超柴"), exempt_of("超柴")),
+        12: add(disc_of("尿素"), exempt_of("尿素")),
+        13: disc_of("副產品"),
+    }
+    qty = lambda p: by_shift(prod[prod["_prod"] == p], "數量")
+    出油量表 = {
+        3: qty("九二").round(0), 4: qty("九五").round(0), 5: qty("超柴").round(0),
+        22: qty("尿素").round(2),
+    }
+    to_cells = lambda table: {r: shift_series_to_cells(s_.round(2)) for r, s_ in table.items()}
+    return {"金額表": to_cells(金額表), "出油量表": to_cells(出油量表), "品項金額": to_cells(品項金額)}
+
+
+# 班報版面：每張表的列標籤與公式（{c} 會換成該班的欄字母，{p} 為前一欄、{t} 為月合計欄）
+_FONT = "新細明體"
+_LABEL_FONT_SIZE = {"金額表": 12, "出油量表": 14, "品項金額": 14}
+
+SHIFT_SHEETS = {
+    "金額表": {
+        "labels": {3: "現金", 4: "簽帳", 6: "中國信託", 7: "聯合信用卡", 8: "美國運通", 9: "信用卡小計",
+                   11: "台灣PAY", 12: "中油PAY(CPC)", 13: "LINE PAY", 14: "Pi錢包", 15: "一卡通(ipass)",
+                   16: "街口(jko pay)", 17: "歐付寶", 18: "橘子支付", 19: "車麻吉", 20: "iCash", 21: "悠遊付",
+                   22: "行動支付", 24: "車隊卡(金額)", 26: "捷利卡(主油)", 27: "捷利卡(尿素)", 28: "捷利卡(副產品)",
+                   29: "禮物卡(主油)", 30: "禮物卡(副產品)", 31: "計程車優惠金額", 32: "計程車紅利金優惠", 33: "小計",
+                   35: "電子優惠券(金額)", 37: "點數折抵主油(金額)", 39: "尿素(現銷)", 40: "尿素(簽帳)",
+                   41: "尿素(車隊卡)", 42: "尿素(捷利卡)", 43: "小計", 45: "二行程", 46: "副產品(簽帳)",
+                   47: "副產品(捷利卡)", 48: "副產品(現銷)", 49: "副產品(兌換)", 50: "小計", 52: "點數兌換商品",
+                   54: "農機免稅", 55: "農機優惠", 56: "折讓", 57: "小計", 59: "試桶", 60: "噴油",
+                   61: "主油銷售額", 62: "實際營業額收入", 64: "發票數量", 65: "發票數量小計", 66: "當日發票金額"},
+        "shift_formulas": {3: "=SUM({c}66-{c}9-{c}22)", 33: "=SUM({c}26:{c}32)", 43: "=SUM({c}39:{c}42)",
+                           50: "=SUM({c}45:{c}49)", 57: "=SUM({c}54:{c}56)",
+                           61: "=SUM(品項金額!{c}3:{c}5)",
+                           62: "=SUM({c}61-{c}57+{c}43+{c}50-{c}52)",
+                           66: "=SUM({c}62-{c}24-{c}33-{c}35-{c}37-{c}4)"},
+        "day_formulas": {65: "=SUM({c}64:{n}64)"},   # 只在 A 班欄，{n} = B 班欄
+        "total_rows": [3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 24, 26, 27, 28, 29, 30, 31, 32,
+                       35, 37, 39, 40, 41, 42, 45, 46, 47, 48, 49, 52, 54, 55, 56, 59, 61, 64, 65, 66],
+        "total_formulas": {22: "=SUM({t}11:{t}21)", 33: "=SUM({t}26:{t}32)", 43: "=SUM({t}39:{t}42)",
+                           50: "=SUM({t}45:{t}49)", 57: "=SUM({t}54:{t}56)",
+                           62: "=SUM({t}61-{t}57+{t}43+{t}50-{t}52)"},
+        "bold_label_rows": None,
+        "width_a": 22.9, "width_data": 9.4, "last_row": 68,
+    },
+    "出油量表": {
+        "labels": {3: "92", 4: "95", 5: "PD(一)", 6: "PD(四)", 7: "班小計", 8: "日總計(電腦帳)",
+                   10: "92", 11: "95", 12: "PD(一)", 13: "PD(四)", 14: "班小計", 15: "日總計(液面鏡)",
+                   17: "92", 18: "95", 19: "PD", 20: "日總計(機械表)",
+                   22: "尿素", 23: "日總計(電腦帳)", 25: "尿素", 26: "日總計(機械表)",
+                   28: "92", 29: "95", 30: "PD(一)", 31: "PD(四)", 32: "班小計"},
+        "shift_formulas": {7: "=SUM({c}3:{c}6)", 14: "=SUM({c}10:{c}13)", 20: "=SUM({c}17:{c}19)",
+                           28: "=SUM({c}10-{c}3)", 29: "=SUM({c}11-{c}4)", 30: "=SUM({c}12-{c}5)",
+                           31: "=SUM({c}13-{c}6)", 32: "=SUM({c}28:{c}31)"},
+        "day_formulas": {8: "={c}7+{n}7", 15: "={c}14+{n}14", 23: "=SUM({c}22+{n}22)", 26: "=SUM({c}25+{n}25)"},
+        "total_rows": [3, 4, 5, 6, 8, 10, 11, 12, 13, 15, 17, 18, 19, 20, 22, 23, 25, 26],
+        "total_formulas": {7: "=SUM({t}3:{t}6)", 14: "=SUM({t}10:{t}13)"},
+        "bold_label_rows": None,
+        "width_a": 29.0, "width_data": 11.8, "last_row": 34,
+    },
+    "品項金額": {
+        "labels": {3: "92", 4: "95", 5: "超柴", 6: "尿素", 7: "副產品", 9: "92折", 10: "95折", 11: "超柴折",
+                   12: "尿素折", 13: "副產品", 17: "折後金額", 18: "92", 19: "95", 20: "超柴", 21: "尿素",
+                   22: "副產品", 23: "銷貨金額"},
+        "shift_formulas": {18: "=SUM({c}3-{c}9)", 19: "=SUM({c}4-{c}10)", 20: "=SUM({c}5-{c}11)",
+                           21: "=SUM({c}6-{c}12)", 22: "=SUM({c}7-{c}13)", 23: "=SUM({c}18:{c}22)"},
+        "day_formulas": {},
+        "total_rows": [3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 18, 19, 20, 21, 22, 23],
+        "total_formulas": {},
+        "bold_label_rows": None,
+        "width_a": 12.4, "width_data": 9.4, "last_row": 23,
+    },
+}
+
+
+def write_shift_report(output_file, data, month):
+    """依班報版面把 data（build_shift_report_data 的結果）寫成 xlsx。"""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    thin, medium = Side(style="thin"), Side(style="medium")
+    center = Alignment(horizontal="center", vertical="center")
+    y, m = str(month).split("-")
+    roc_label = f"{int(y) - 1911}.{m}"
+
+    for sheet_name, spec in SHIFT_SHEETS.items():
+        ws = wb.create_sheet(sheet_name)
+        size = _LABEL_FONT_SIZE[sheet_name]
+        last_row = spec["last_row"]
+        tcol = get_column_letter(TOTAL_COL)
+        # 表頭
+        ws.cell(1, 1, "日期")
+        ws.cell(2, 1, "班別")
+        for day in range(1, DAYS_IN_SHEET + 1):
+            ca = shift_col(day, "A")
+            ws.cell(1, ca, day)
+            ws.merge_cells(start_row=1, start_column=ca, end_row=1, end_column=ca + 1)
+            ws.cell(2, ca, "A")
+            ws.cell(2, ca + 1, "B")
+        ws.cell(1, TOTAL_COL, "月合計")
+        # 標籤
+        for r, label in spec["labels"].items():
+            ws.cell(r, 1, label)
+        # 數字
+        for r, cells in data.get(sheet_name, {}).items():
+            for c, v in cells.items():
+                ws.cell(r, c, float(v) if abs(v - round(v)) > 1e-9 else int(round(v)))
+        # 每班公式
+        for day in range(1, DAYS_IN_SHEET + 1):
+            for ab in ("A", "B"):
+                c = get_column_letter(shift_col(day, ab))
+                for r, f in spec["shift_formulas"].items():
+                    ws.cell(r, shift_col(day, ab), f.format(c=c, t=tcol))
+            ca = shift_col(day, "A")
+            for r, f in spec["day_formulas"].items():
+                ws.cell(r, ca, f.format(c=get_column_letter(ca), n=get_column_letter(ca + 1), t=tcol))
+        # 月合計
+        first, last = get_column_letter(FIRST_DATA_COL), get_column_letter(LAST_DATA_COL)
+        for r in spec["total_rows"]:
+            ws.cell(r, TOTAL_COL, f"=SUM({first}{r}:{last}{r})")
+        for r, f in spec["total_formulas"].items():
+            ws.cell(r, TOTAL_COL, f.format(t=tcol))
+        # 樣式
+        for r in range(1, last_row + 1):
+            for c in range(1, TOTAL_COL + 1):
+                cell = ws.cell(r, c)
+                is_label = c == 1
+                cell.font = Font(name=_FONT, size=14 if r <= 2 else size if is_label else 12, bold=is_label or r <= 2)
+                cell.alignment = center
+                cell.border = Border(
+                    left=medium if c == 1 else thin, right=medium if c == TOTAL_COL else thin,
+                    top=medium if r == 1 else thin, bottom=medium if r == last_row else thin,
+                )
+        ws.column_dimensions["A"].width = spec["width_a"]
+        for c in range(FIRST_DATA_COL, TOTAL_COL + 1):
+            ws.column_dimensions[get_column_letter(c)].width = spec["width_data"] if c < TOTAL_COL else 11
+        ws.row_dimensions[1].height = 19.8
+        ws.row_dimensions[2].height = 19.8
+        ws.freeze_panes = "B3"
+
+    ws = wb["金額表"]
+    ws.cell(68, 1, roc_label).font = Font(name=_FONT, size=12, bold=True)
+    # 品項金額右側的備註欄（比照班報）
+    ws = wb["品項金額"]
+    ws.cell(1, TOTAL_COL + 1, "車隊卡折讓")
+    ws.cell(1, TOTAL_COL + 2, "賖銷折讓")
+    # 出油量表下方的進油表（只留表頭，進油量 CSV 沒有）
+    ws = wb["出油量表"]
+    for c, v in zip(range(2, 6), ["日期", "92", "95", "PD(一)"]):
+        ws.cell(34, c, v).font = Font(name=_FONT, size=12)
+    # 說明
+    notes = [
+        f"由 交易查詢會總表.csv 產生（{month}）。A 班 = 列帳班別 _2，B 班 = 列帳班別 _3。",
+        "算不出來的格子留空：信用卡與行動支付各品牌（只填小計）、液面鏡、機械表、PD(四)（超柴全部放 PD(一)）、進油、噴油、農機優惠、二行程。",
+        "現金 = 當日發票金額 − 信用卡 − 行動支付；信用卡 = 付款類別 931 發票金額；行動支付 = 939 發票金額；簽帳 = 903 未開發票交易總金額。",
+        "折讓 = 折抵額列；農機免稅 = 有發票但 交易總 − 發票 − 折扣金額 ≠ 0 的差額（同時加進品項金額的原價與折）；試桶 = 付款類別 900。",
+    ]
+    ws = wb["金額表"]
+    for i, line in enumerate(notes):
+        ws.cell(70 + i, 1, line).font = Font(name=_FONT, size=10)
+    wb.save(output_file)
+
+
 def month_label(month):
     """'2026-09' -> '2026年09月'，用在輸出檔名。"""
     y, m = str(month).split("-")
@@ -511,6 +854,11 @@ for month, df_month in df_valid.groupby("月份"):
                 ws.column_dimensions[get_column_letter(ci)].width = 12
         print(f"   ✅ 已儲存: {output_file}")
         file_count += 1
+
+        # 班報（比照手算班報格式）
+        report_file = os.path.join(current_dir, f"班報_{month_label(month)}.xlsx")
+        write_shift_report(report_file, build_shift_report_data(df[df["月份"] == month]), month)
+        print(f"   ✅ 已儲存: {report_file}")
     except Exception as e:
         print(f"   ❌ 處理月份 {month} 時發生錯誤：{str(e)}")
         import traceback
