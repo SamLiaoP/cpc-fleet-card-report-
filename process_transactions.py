@@ -246,23 +246,18 @@ print(f"\n📊 拆分後彙整列數：{len(df_split)}")
 # ================================
 # 發票與折扣表（每月一張，放在「油品交易彙總」檔的第二個頁籤）
 # ================================
-# 每筆交易（島號+槍號+交易時間）的「交易總金額」「發票金額」「折扣金額」是表頭欄位，群組內每列相同。
-# 折扣額規則（已和手算班報逐日核對）：
-#   - 發票金額 ≠ 0 且交易內沒有「點數折抵商品A58 / 點數折抵免稅商品A59」列 → 折扣額 = 表頭「折扣金額」欄
-#   - 其他情況（車隊卡、捷利卡、禮物卡、簽帳等未開發票交易，以及點數兌換商品交易）→ 折扣額 = 0
-#   對應班報：折讓 + 計程車優惠金額 + 計程車紅利金優惠 + 點數折抵主油。
-#   點數折抵商品（A58/A59）的折抵金額另外列在「副產品 / 點數折抵額」，對應班報「點數兌換商品」。
-# 一筆交易若含多個商品，表頭金額依各商品「商品金額」比例分攤到商品；
-# 折扣額只分攤給油品（九二/九五/超柴/尿素），交易內沒有油品時才分攤給副產品。
-# 每筆交易只歸到一個付款類別：取該筆交易內付款列金額（絕對值）最大的那個；
-# 沒有任何付款列的交易（現金 / 刷卡 / 簽帳等）歸「其他(無付款列)」。
+# 全部以「商品列」為基礎計算（已和手算班報「品項金額」頁逐日核對）：
+#   總金額   = 各商品列「商品金額」加總（排除試桶 = 付款類別 900）；
+#              副產品扣掉點數折抵商品A58/A59 的折抵金額，只留現金付的部分
+#   折扣額   = 「92無鉛汽油折抵額」「95無鉛汽油折抵額」「超級柴油折抵額」等折抵額列，依油品歸類
+#   農機免稅 = 有開發票但 交易總金額 − 發票金額 − 折扣金額 ≠ 0 的差額（付款類別 931、稅別 TF），
+#              比照班報同時加進總金額與折扣額
+#   折後金額 = 總金額 − 折扣額
+# 捷利卡優惠點、紅利金、點數折抵主油等不算折扣，另外列在第二張表對班報「金額表」。
 INVOICE_PRODUCTS = ["九二", "九五", "超柴", "尿素", "副產品"]
-INVOICE_FUELS = ["九二", "九五", "超柴", "尿素"]
 POINT_GOODS_ROWS = ["點數折抵商品A58", "點數折抵免稅商品A59"]
-INVOICE_ROW_ORDER = categories + POINT_GOODS_ROWS
-OTHER_ROW = "其他(現金/刷卡/簽帳，無付款列)"
-TOTAL_ROW = "總計"
-_all_payment_names = set(INVOICE_ROW_ORDER)
+TEST_BUCKET_PAY_TYPE = 900
+_all_payment_names = set(categories + POINT_GOODS_ROWS)
 
 
 def invoice_product(name):
@@ -282,83 +277,100 @@ def invoice_product(name):
     return "副產品"
 
 
+def discount_product(name):
+    """折抵額列歸到哪個油品（名稱如 92無鉛汽油折抵額 / 95無鉛汽油折抵額 / 超級柴油免稅折抵額）。"""
+    if "92" in name or "九二" in name:
+        return "九二"
+    if "95" in name or "九五" in name:
+        return "九五"
+    if "柴油" in name:
+        return "超柴"
+    if "尿素" in name:
+        return "尿素"
+    return "副產品"
+
+
 def build_invoice_table(df_all):
-    """回傳 (表格 DataFrame, 說明文字 list)。表格 index 為付款類別，欄為 (產品, 指標)。"""
+    """回傳 (品項金額表, 其他項目表, 說明文字 list)。"""
     d = df_all[df_all["月份"].notna()].copy()
-    d["_prod"] = d["商品名稱"].apply(invoice_product)
-    d["_is_pay"] = d["商品名稱"].isin(_all_payment_names)
-    d["_is_point_goods"] = d["商品名稱"].isin(POINT_GOODS_ROWS)
     key = ["島號", "槍號", "交易時間"]
     for c in ["交易總金額", "發票金額", "折扣金額", "商品金額"]:
         d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+    d["_paytype"] = pd.to_numeric(d["付款類別"], errors="coerce")
+    name = d["商品名稱"].astype(str)
+    d["_prod"] = d["商品名稱"].apply(invoice_product)
+    d["_is_discount_row"] = name.str.contains("折抵額", na=False)
+    d["_is_test"] = d["_paytype"] == TEST_BUCKET_PAY_TYPE
 
-    # 每筆交易的主要付款類別：付款列金額絕對值最大者
-    pay = d[d["_is_pay"]].copy()
-    pay["_abs"] = pay["商品金額"].abs()
-    pay_sum = pay.groupby(key + ["商品名稱"])["_abs"].sum().reset_index()
-    pay_sum = pay_sum.sort_values("_abs", ascending=False).drop_duplicates(key)
-    pay_sum = pay_sum.rename(columns={"商品名稱": "_row"})[key + ["_row"]]
-    d = d.merge(pay_sum, on=key, how="left")
-    d["_row"] = d["_row"].fillna(OTHER_ROW)
+    # ---- 總金額：商品列，排除試桶 ----
+    prod = d[d["_prod"].notna() & ~d["_is_test"]]
+    total = prod.groupby("_prod")["商品金額"].sum().reindex(INVOICE_PRODUCTS).fillna(0)
+    point_goods = -d.loc[d["商品名稱"].isin(POINT_GOODS_ROWS), "商品金額"].sum()
+    total["副產品"] -= point_goods
 
-    # 折扣額：有發票且非點數兌換商品交易 → 表頭折扣金額；否則 0
-    txn_has_point_goods = d.groupby(key)["_is_point_goods"].transform("any")
-    d["_折扣"] = np.where((d["發票金額"] != 0) & (~txn_has_point_goods), d["折扣金額"], 0.0)
+    # ---- 折扣額：折抵額列 ----
+    dz = d[d["_is_discount_row"]].copy()
+    dz["_dprod"] = dz["商品名稱"].astype(str).apply(discount_product)
+    discount = (-dz.groupby("_dprod")["商品金額"].sum()).reindex(INVOICE_PRODUCTS).fillna(0)
 
-    # 表頭金額依商品金額比例分攤到各商品列
-    prod = d[d["_prod"].notna()].copy()
-    prod_sum = prod.groupby(key)["商品金額"].transform("sum")
-    weight = np.where(prod_sum != 0, prod["商品金額"] / prod_sum.replace(0, np.nan), 0)
-    prod["交易總金額_分攤"] = prod["交易總金額"] * weight
-    prod["發票金額_分攤"] = prod["發票金額"] * weight
-    # 折扣額優先分攤給油品；交易內沒有油品時才分攤給副產品
-    is_fuel = prod["_prod"].isin(INVOICE_FUELS)
-    fuel_sum = prod["商品金額"].where(is_fuel, 0).groupby([prod[k] for k in key]).transform("sum")
-    has_fuel = prod["_prod"].isin(INVOICE_FUELS).groupby([prod[k] for k in key]).transform("any")
-    disc_weight = np.where(
-        has_fuel,
-        np.where(is_fuel & (fuel_sum != 0), prod["商品金額"] / fuel_sum.replace(0, np.nan), 0),
-        weight,
+    # ---- 農機免稅：有發票但 交易總 − 發票 − 折扣欄 ≠ 0，依交易內商品金額比例歸到商品 ----
+    hdr = d.groupby(key).agg(交易總=("交易總金額", "first"), 發票=("發票金額", "first"), 折扣=("折扣金額", "first"))
+    hdr["_exempt"] = np.where(hdr["發票"] != 0, hdr["交易總"] - hdr["發票"] - hdr["折扣"], 0.0)
+    ex = prod.merge(hdr[["_exempt"]], left_on=key, right_index=True, how="left")
+    ex_sum = ex.groupby(key)["商品金額"].transform("sum")
+    ex["_share"] = ex["_exempt"].fillna(0) * np.where(ex_sum != 0, ex["商品金額"] / ex_sum.replace(0, np.nan), 0)
+    exempt = ex.groupby("_prod")["_share"].sum().reindex(INVOICE_PRODUCTS).fillna(0)
+
+    total_adj = total + exempt
+    discount_adj = discount + exempt
+    item = pd.DataFrame(
+        [total_adj, discount_adj, total_adj - discount_adj],
+        index=pd.Index(["總金額", "折扣額", "折後金額"], name="項目"),
     )
-    prod["折扣額_分攤"] = prod["_折扣"] * np.nan_to_num(disc_weight)
+    item["合計"] = item.sum(axis=1)
+    item = item.round(0).astype(int)
 
-    agg = prod.groupby(["_row", "_prod"]).agg(
-        交易總金額=("交易總金額_分攤", "sum"),
-        發票金額=("發票金額_分攤", "sum"),
-        折扣額=("折扣額_分攤", "sum"),
+    # ---- 其他項目（對班報「金額表」）----
+    def pay_sum(pname, mask=None):
+        m = d["商品名稱"] == pname
+        if mask is not None:
+            m &= mask
+        return -d.loc[m, "商品金額"].sum()
+
+    has_bonus = d.groupby(key)["商品名稱"].transform(lambda s: (s == "捷利卡優惠點消費－應稅").any())
+    jet_total = pay_sum("捷利卡消費 (A53")
+    jet_bonus = pay_sum("捷利卡消費 (A53", has_bonus)
+    test_by_prod = d[d["_is_test"] & d["_prod"].notna()].groupby("_prod")["商品金額"].sum()
+    invoices = hdr[hdr["發票"] != 0]
+    others = pd.DataFrame(
+        [
+            ("車隊卡消費", pay_sum("車隊卡消費 (A55"), "班報：車隊卡(金額)"),
+            ("捷利卡消費（整筆捷利卡付款）", jet_total - jet_bonus, "班報：捷利卡(主油)+(尿素)+(副產品)"),
+            ("捷利卡紅利金（與現金混合付款的捷利卡部分）", jet_bonus, "班報：計程車紅利金優惠"),
+            ("捷利卡優惠點", pay_sum("捷利卡優惠點消費－應稅"), "班報：計程車優惠金額"),
+            ("禮物卡消費", pay_sum("禮物卡消費－應稅"), "班報：禮物卡(主油)+(副產品)"),
+            ("電子優惠券", pay_sum("其他應收款-電子優惠券"), "班報：電子優惠券(金額)"),
+            ("點數折抵主油", pay_sum("點數折抵主油A57"), "班報：點數折抵主油(金額)"),
+            ("點數折抵商品（A58+A59）", point_goods, "班報：點數兌換商品；已從副產品總金額扣除"),
+            ("農機免稅", exempt.sum(), "班報：農機免稅；已加進總金額與折扣額"),
+            ("試桶（付款類別 900）", test_by_prod.sum(), "班報：試桶；未計入總金額。" + "、".join(f"{k} {int(v)}" for k, v in test_by_prod.items())),
+            ("發票金額（交易表頭合計）", hdr["發票"].sum(), "班報：當日發票金額合計"),
+            ("發票張數", int((invoices["發票"] > 0).sum() - (invoices["發票"] < 0).sum()), "班報：發票數量（扣除作廢）"),
+        ],
+        columns=["項目", "金額", "對應班報"],
     )
-    # 點數折抵商品（A58/A59）折抵金額，依付款類別列
-    point_amt = -d[d["_is_point_goods"]].groupby("_row")["商品金額"].sum()
-
-    rows = [r for r in INVOICE_ROW_ORDER if r in agg.index.get_level_values(0) or r in point_amt.index] + [OTHER_ROW]
-    table = pd.DataFrame(index=pd.Index(rows, name="付款類別"))
-    for p in INVOICE_PRODUCTS:
-        metrics = ["發票金額", "點數折抵額"] if p == "副產品" else ["交易總金額", "發票金額", "折扣額"]
-        for m in metrics:
-            if m == "點數折抵額":
-                table[(p, m)] = point_amt.reindex(rows).fillna(0).values
-                continue
-            vals = agg[m].unstack("_prod").get(p) if p in agg.index.get_level_values(1) else None
-            table[(p, m)] = vals.reindex(rows).fillna(0).values if vals is not None else 0.0
-    table[("合計", "發票金額")] = sum(table[(p, "發票金額")] for p in INVOICE_PRODUCTS)
-    # 合計折扣額含分攤到副產品的極少數折扣（交易內沒有油品時），所以可能略大於四油品相加
-    all_disc = agg["折扣額"].groupby("_row").sum().reindex(rows).fillna(0).values
-    table[("合計", "折扣額")] = all_disc
-    table.loc[TOTAL_ROW] = table.sum()
-    table.columns = pd.MultiIndex.from_tuples(table.columns, names=["產品", "指標"])
-    table = table.round(0).astype(int)
+    others["金額"] = others["金額"].round(0).astype(int)
 
     notes = [
         "說明：",
-        "1. 折扣額：發票金額≠0 且非點數兌換商品的交易，取表頭「折扣金額」欄；其他交易為 0。",
-        "   對應班報：折讓 + 計程車優惠金額 + 計程車紅利金優惠 + 點數折抵主油。",
-        "2. 車隊卡、捷利卡、禮物卡、簽帳交易現場不開發票，發票金額為 0，不算折扣。",
-        "3. 副產品/點數折抵額 = 點數折抵商品A58、A59 的折抵金額，對應班報「點數兌換商品」。",
-        "4. 一筆交易含多個商品時，表頭金額依各商品「商品金額」比例分攤；折扣額只分攤給油品。",
-        "5. 每筆交易只歸到一個付款類別（付款列金額最大者）；無付款列者歸「其他」。",
-        "6. 副產品 = 非九二/九五/超柴/尿素的其他商品。作廢交易為負值，已自動沖銷。",
+        "1. 總金額 = 各商品列「商品金額」加總，排除試桶（付款類別 900）；副產品已扣掉點數折抵商品 A58/A59 的折抵金額。",
+        "2. 折扣額 = 92/95 無鉛汽油折抵額、超級柴油折抵額等折抵額列，依油品歸類。",
+        "3. 農機免稅 = 有開發票但 交易總金額 − 發票金額 − 折扣金額 ≠ 0 的差額，比照班報同時加進總金額與折扣額。",
+        "4. 折後金額 = 總金額 − 折扣額，對應班報「品項金額」頁的折後金額；不是 CSV 的發票金額欄（車隊卡、簽帳的發票金額為 0）。",
+        "5. 捷利卡優惠點、紅利金、點數折抵主油不算折扣，列在第二張表對班報「金額表」。",
+        "6. 日期以交易時間為準；班報以列帳班別為準，跨月晚班的交易會落在不同月份。作廢交易為負值，已自動沖銷。",
     ]
-    return table, notes
+    return item, others, notes
 
 
 def month_label(month):
@@ -402,20 +414,27 @@ for month, df_month in df_valid.groupby("月份"):
         )
 
         # 發票與折扣表
-        invoice_table, invoice_notes = build_invoice_table(df[df["月份"] == month])
+        item_table, other_table, invoice_notes = build_invoice_table(df[df["月份"] == month])
 
         # 存成 Excel：第一頁 油品彙總（原表），第二頁 發票與折扣
         output_file = os.path.join(current_dir, f"油品交易彙總_{month_label(month)}.xlsx")
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
             summary_df.to_excel(writer, sheet_name="油品彙總")
-            invoice_table.to_excel(writer, sheet_name="發票與折扣")
-            ws = writer.sheets["發票與折扣"]
-            start = len(invoice_table) + 5
+            sheet = "發票與折扣"
+            item_table.to_excel(writer, sheet_name=sheet, startrow=1)
+            ws = writer.sheets[sheet]
+            ws.cell(row=1, column=1, value="品項金額（對班報「品項金額」頁）")
+            row2 = len(item_table) + 5
+            ws.cell(row=row2 - 1, column=1, value="其他項目（對班報「金額表」）")
+            other_table.to_excel(writer, sheet_name=sheet, startrow=row2 - 1, index=False)
+            row3 = row2 + len(other_table) + 3
             for i, line in enumerate(invoice_notes):
-                ws.cell(row=start + i, column=1, value=line)
+                ws.cell(row=row3 + i, column=1, value=line)
             from openpyxl.utils import get_column_letter
-            ws.column_dimensions["A"].width = 30
-            for ci in range(2, ws.max_column + 1):
+            ws.column_dimensions["A"].width = 42
+            ws.column_dimensions["B"].width = 14
+            ws.column_dimensions["C"].width = 60
+            for ci in range(4, ws.max_column + 1):
                 ws.column_dimensions[get_column_letter(ci)].width = 12
         print(f"   ✅ 已儲存: {output_file}")
         file_count += 1
