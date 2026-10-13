@@ -13,7 +13,7 @@ print("================================")
 print(" 中油車隊卡 交易彙整工具")
 print("================================")
 print()
-print("當前版本號 1201_v5")
+print("當前版本號 2026_1013_v6")
 
 # 獲取當前目錄
 current_dir = os.path.dirname(os.path.abspath(__file__))
