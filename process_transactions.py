@@ -162,6 +162,16 @@ if invalid_time_count > 0:
 
 df["月份"] = df["交易時間"].dt.strftime("%Y-%m")
 
+# 分月以「列帳班別」為準（格式 1150901_2 = 民國 115 年 09 月 01 日 第 2 班），
+# 跟手算班報一致：跨午夜的晚班交易會算在列帳當天，而不是交易時間的日期。
+# 無法解析列帳班別的列才退回用交易時間。
+if "列帳班別" in df.columns:
+    _lb = df["列帳班別"].astype(str).str.strip().str.extract(r"^(\d{3})(\d{2})(\d{2})_")
+    _lb_ok = _lb[0].notna() & df["交易時間"].notna()
+    df.loc[_lb_ok, "月份"] = (_lb.loc[_lb_ok, 0].astype(int) + 1911).astype(str) + "-" + _lb.loc[_lb_ok, 1]
+    _moved = (_lb_ok & (df["月份"] != df["交易時間"].dt.strftime("%Y-%m"))).sum()
+    print(f"📅 分月以列帳班別為準：{int(_lb_ok.sum())} / {len(df)} 列可解析，其中 {int(_moved)} 列的月份與交易時間不同")
+
 # 檢查月份欄位
 valid_month_count = df["月份"].notna().sum()
 print(f"✅ 有效月份資料筆數：{valid_month_count} / {len(df)}")
@@ -190,17 +200,6 @@ fuel_mapping = {
     "機油精": "機油精",
 }
 
-# Per-row 標記 油品類（每筆商品列依其商品名稱判斷）
-def classify_product(name):
-    if not isinstance(name, str):
-        return None
-    for ftype, keyword in fuel_mapping.items():
-        if re.search(keyword, name):
-            return ftype
-    return None
-
-df["油品類"] = df["商品名稱"].apply(classify_product)
-
 # 定義商品類別（付款摘要列；做為 summary 表的 row index）
 categories = [
     "其他應收款-電子優惠券",
@@ -210,25 +209,73 @@ categories = [
     "車隊卡消費 (A55",
     "點數折抵主油A57"
 ]
+NON_PRODUCT_ROWS = set(categories + ["點數折抵商品A58", "點數折抵免稅商品A59"])
+FIXED_PRODUCT_ORDER = list(fuel_mapping.keys())
+OIL_SUMMARY_TYPES = ["九二", "九五", "超柴", "尿素"]  # 油品彙總表只輸出這四欄
+
+
+# Per-row 標記 油品類（每筆商品列依其商品名稱判斷）
+# 油品與添加劑用 fuel_mapping 的簡稱；其他商品（衛生紙、米、飲料…）直接用商品名稱，
+# 這樣油品彙總表會列出所有商品，付款列的金額才能完整分攤。
+def classify_product(name):
+    if not isinstance(name, str):
+        return None
+    if name in NON_PRODUCT_ROWS or "折抵額" in name:
+        return None
+    for ftype, keyword in fuel_mapping.items():
+        if re.search(keyword, name):
+            return ftype
+    return name.strip()
+
+df["油品類"] = df["商品名稱"].apply(classify_product)
 
 # 把每個交易群組裡的「付款列金額」依「群內各商品金額」比例拆給每個商品
 # 產生 (付款列商品名稱, 商品油品類) 的虛擬列，金額 = 商品金額 × (付款列金額/群內商品金額總和)
 # 這樣油料/添加劑各歸各的欄，付款列總額（含多個折抵列）會正確分配。
+# 沒有付款列（或付款列金額不足整筆）的部分，依「付款類別」代碼另立一列，
+# 這樣油品彙總的總計才會等於整月出油量。代碼對應是從班報金額表的合計反推：
+#   901 現金、903 簽帳、905 車隊卡、931 信用卡、939 行動支付、900 試桶
+TEST_BUCKET_PAY_TYPE = 900
+PAY_TYPE_LABELS = {
+    900: "試桶(付款類別900)",
+    901: "現金(付款類別901)",
+    903: "簽帳(付款類別903)",
+    905: "車隊卡(付款類別905)",
+    931: "信用卡(付款類別931)",
+    939: "行動支付(付款類別939)",
+}
+POINT_GOODS_ROWS = ["點數折抵商品A58", "點數折抵免稅商品A59"]
+_payment_names_for_split = categories + POINT_GOODS_ROWS
+
+
+def pay_type_label(code):
+    try:
+        code = int(float(code))
+    except (TypeError, ValueError):
+        return "未知付款類別"
+    return PAY_TYPE_LABELS.get(code, f"付款類別{code}")
+
+
 virtual_rows = []
 for _key, _g in df.groupby(["島號", "槍號", "交易時間"]):
     _products = _g[_g["油品類"].notna()]
-    _payments = _g[_g["商品名稱"].isin(categories)]
-    if _products.empty or _payments.empty:
+    if _products.empty:
         continue
     _sum_prod = _products["商品金額"].sum()
     if _sum_prod == 0:
         continue
-    for _, _p in _payments.iterrows():
+    _payments = _g[_g["商品名稱"].isin(_payment_names_for_split)]
+    # 付款列金額為負；整筆商品金額扣掉付款列後剩下的，就是用現金/刷卡/簽帳等付的部分
+    _pay_rows = [(_p["商品名稱"], _p["商品金額"]) for _, _p in _payments.iterrows()]
+    _remain = _sum_prod + _payments["商品金額"].sum()
+    if abs(_remain) >= 0.5:
+        _pay_rows.append((pay_type_label(_g["付款類別"].iloc[0]), -_remain))
+    for _name, _amt in _pay_rows:
         # 保留正負號：付款金額/退款金額在後續 abs(sum()) 才能正確抵消
-        _ratio = _p["商品金額"] / _sum_prod
+        _ratio = _amt / _sum_prod
         for _, _pr in _products.iterrows():
             virtual_rows.append({
-                "商品名稱": _p["商品名稱"],
+                "商品名稱": _name,
                 "油品類": _pr["油品類"],
                 "商品金額": _pr["商品金額"] * _ratio,
                 "油品類數量": _pr["數量"] * _ratio,
@@ -256,7 +303,6 @@ print(f"\n📊 拆分後彙整列數：{len(df_split)}")
 # 捷利卡優惠點、紅利金、點數折抵主油等不算折扣，另外列在第二張表對班報「金額表」。
 INVOICE_PRODUCTS = ["九二", "九五", "超柴", "尿素", "副產品"]
 POINT_GOODS_ROWS = ["點數折抵商品A58", "點數折抵免稅商品A59"]
-TEST_BUCKET_PAY_TYPE = 900
 _all_payment_names = set(categories + POINT_GOODS_ROWS)
 
 
@@ -338,17 +384,35 @@ def build_invoice_table(df_all):
         return -d.loc[m, "商品金額"].sum()
 
     has_bonus = d.groupby(key)["商品名稱"].transform(lambda s: (s == "捷利卡優惠點消費－應稅").any())
-    jet_total = pay_sum("捷利卡消費 (A53")
     jet_bonus = pay_sum("捷利卡消費 (A53", has_bonus)
+
+    def split_payment(pname, mask=None):
+        """把某付款列的金額依交易內各商品金額比例拆成 主油 / 尿素 / 副產品。"""
+        m = d["商品名稱"] == pname
+        if mask is not None:
+            m &= mask
+        pay_txn = -d.loc[m].groupby(key)["商品金額"].sum()
+        pr = d[d["_prod"].notna() & ~d["_is_test"]].copy()
+        pr["_grp"] = np.select([pr["_prod"].isin(["九二", "九五", "超柴"]), pr["_prod"] == "尿素"], ["主油", "尿素"], "副產品")
+        pr = pr.merge(pay_txn.rename("_pay"), left_on=key, right_index=True, how="inner")
+        txn_sum = pr.groupby(key)["商品金額"].transform("sum")
+        pr["_alloc"] = pr["_pay"] * np.where(txn_sum != 0, pr["商品金額"] / txn_sum.replace(0, np.nan), 0)
+        return pr.groupby("_grp")["_alloc"].sum().reindex(["主油", "尿素", "副產品"]).fillna(0)
+
+    jet = split_payment("捷利卡消費 (A53", ~has_bonus)
+    gift = split_payment("禮物卡消費－應稅")
     test_by_prod = d[d["_is_test"] & d["_prod"].notna()].groupby("_prod")["商品金額"].sum()
     invoices = hdr[hdr["發票"] != 0]
     others = pd.DataFrame(
         [
             ("車隊卡消費", pay_sum("車隊卡消費 (A55"), "班報：車隊卡(金額)"),
-            ("捷利卡消費（整筆捷利卡付款）", jet_total - jet_bonus, "班報：捷利卡(主油)+(尿素)+(副產品)"),
+            ("捷利卡(主油)", jet["主油"], "班報：捷利卡(主油)"),
+            ("捷利卡(尿素)", jet["尿素"], "班報：捷利卡(尿素)"),
+            ("捷利卡(副產品)", jet["副產品"], "班報：捷利卡(副產品)"),
             ("捷利卡紅利金（與現金混合付款的捷利卡部分）", jet_bonus, "班報：計程車紅利金優惠"),
             ("捷利卡優惠點", pay_sum("捷利卡優惠點消費－應稅"), "班報：計程車優惠金額"),
-            ("禮物卡消費", pay_sum("禮物卡消費－應稅"), "班報：禮物卡(主油)+(副產品)"),
+            ("禮物卡(主油)", gift["主油"] + gift["尿素"], "班報：禮物卡(主油)"),
+            ("禮物卡(副產品)", gift["副產品"], "班報：禮物卡(副產品)"),
             ("電子優惠券", pay_sum("其他應收款-電子優惠券"), "班報：電子優惠券(金額)"),
             ("點數折抵主油", pay_sum("點數折抵主油A57"), "班報：點數折抵主油(金額)"),
             ("點數折抵商品（A58+A59）", point_goods, "班報：點數兌換商品；已從副產品總金額扣除"),
@@ -386,7 +450,8 @@ file_count = 0
 for month, df_month in df_valid.groupby("月份"):
     print(f"\n📅 處理月份：{month} (共 {len(df_month)} 筆拆分列)")
 
-    df_filtered = df_month
+    # 油品彙總只列四種油品；其他商品仍參與付款列的比例拆分，只是不輸出
+    df_filtered = df_month[df_month["油品類"].isin(OIL_SUMMARY_TYPES)]
 
     if len(df_filtered) == 0:
         print(f"   ⚠️ 該月份沒有符合商品類別的資料，跳過")
@@ -398,13 +463,8 @@ for month, df_month in df_valid.groupby("月份"):
             商品金額總=pd.NamedAgg(column="商品金額", aggfunc=lambda x: abs(x.sum()) if x.notna().any() else 0)
         ).unstack(fill_value=0)
 
-        # 確保所有油品類（含添加劑）欄位都存在，缺的補 0
-        _all_oil_types = ["九二", "九五", "尿素", "超柴", "柴油精", "汽油精", "機油精"]
-        for _metric in ["油品類數量總", "商品金額總"]:
-            for _oil in _all_oil_types:
-                if (_metric, _oil) not in summary_df.columns:
-                    summary_df[(_metric, _oil)] = 0
-        # 重新排序欄位
+        # 欄位固定為四種油品，缺的補 0
+        _all_oil_types = OIL_SUMMARY_TYPES
         summary_df = summary_df.reindex(
             columns=pd.MultiIndex.from_product(
                 [["油品類數量總", "商品金額總"], _all_oil_types],
@@ -412,6 +472,19 @@ for month, df_month in df_valid.groupby("月份"):
             ),
             fill_value=0,
         )
+        # 金額合計欄（數量單位不同，不加總）
+        summary_df[("商品金額總", "合計")] = summary_df["商品金額總"].sum(axis=1)
+        # 列順序：付款列類別 → 各付款類別代碼 → 總計；試桶另外放在總計下方，不計入總計
+        _test_label = PAY_TYPE_LABELS[TEST_BUCKET_PAY_TYPE]
+        _row_order = categories + POINT_GOODS_ROWS + [v for v in PAY_TYPE_LABELS.values() if v != _test_label]
+        _rows = [c for c in _row_order if c in summary_df.index] + sorted(
+            c for c in summary_df.index if c not in _row_order and c != _test_label
+        )
+        _test_row = summary_df.loc[[_test_label]] if _test_label in summary_df.index else None
+        summary_df = summary_df.reindex(index=_rows)
+        summary_df.loc["總計"] = summary_df.sum()
+        if _test_row is not None:
+            summary_df = pd.concat([summary_df, _test_row])
 
         # 發票與折扣表
         item_table, other_table, invoice_notes = build_invoice_table(df[df["月份"] == month])
